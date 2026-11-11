@@ -5,7 +5,11 @@ from typing import Literal, Self
 
 
 class Database:
-    def __init__(self, db_path: Path | str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        timeout: float = 30.0,
+    ) -> None:
         self._conn = sqlite3.connect(
             str(db_path),
             timeout=timeout,
@@ -14,7 +18,10 @@ class Database:
         )
 
     # region PRAGMA
-    def set_auto_vacuum(self, value: Literal["NONE", "FULL", "INCREMENTAL"]) -> None:
+    def set_auto_vacuum(
+        self,
+        value: Literal["NONE", "FULL", "INCREMENTAL"],
+    ) -> None:
         if value not in ("NONE", "FULL", "INCREMENTAL"):
             raise ValueError(f"Invalid auto_vacuum value: {value!r}")
 
@@ -42,6 +49,7 @@ class Database:
     def close(self) -> None:
         self._conn.close()
 
+    # region context funcs
     def __enter__(self) -> Self:
         self._conn.execute("BEGIN")
         return self
@@ -57,6 +65,8 @@ class Database:
 
         else:
             self._conn.execute("ROLLBACK")
+
+    # endregion
 
 
 # TODO: бога убить
