@@ -1,6 +1,6 @@
 import pytest
 
-from src.litecrate.utils.colum_unils import (
+from src.litecrate.utils import (
     INDEX_BIT,
     NOT_NULL_BIT,
     PRIMARY_BIT,

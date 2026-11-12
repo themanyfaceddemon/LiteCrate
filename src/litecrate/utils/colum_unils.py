@@ -1,7 +1,7 @@
-INDEX_BIT: int = 1 << 3
-NOT_NULL_BIT: int = 1 << 0
+INDEX_BIT: int = 1 << 0
+NOT_NULL_BIT: int = 1 << 1
 PRIMARY_BIT: int = 1 << 2
-UNIQUE_BIT: int = 1 << 1
+UNIQUE_BIT: int = 1 << 3
 
 
 def _column_flag(value: str) -> int:
