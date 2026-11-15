@@ -1,12 +1,19 @@
 import sqlite3
-from copy import deepcopy
-from hashlib import blake2s
+from copy import copy, deepcopy
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self
 
-from ..utils import INDEX_BIT, NOT_NULL_BIT, PRIMARY_BIT, UNIQUE_BIT, parse_column
-from ..utils import sanitize_identifier as san
+from ..utils import (
+    check_column_name,
+    check_table_name,
+    get_index_identifier,
+    normalize_identifier,
+    normalize_identifiers,
+    parse_colum_into_sql,
+    sanitize_identifier,
+    sanitize_identifiers,
+)
 
 
 class Database:
@@ -22,91 +29,117 @@ class Database:
             check_same_thread=False,
         )
 
-        self._cache: dict = {}
-        self._rollback_cache: dict | None = None
+        self._cache: dict[str, dict[str, type | None]] = {}
+        self._rollback_cache: dict[str, dict[str, type | None]] | None = None
 
-    # region helpers
-    @staticmethod
-    def _get_colums_sql_create(
-        colum: str,
-        table_name: str,
-        san_table_name: str,
-    ) -> tuple[str, str | None]:
-        return_index = None
-
-        bits, colum_name, colum_type = parse_column(colum)
-        san_colum_name = san(colum_name)
-        return_sql = f"{san_colum_name} {colum_type or ''}".rstrip()
-
-        if bits & INDEX_BIT and not (bits & (PRIMARY_BIT | UNIQUE_BIT)):
-            raw = f"{table_name}\0{colum_name}".encode()
-            index_name = f"idx_{blake2s(raw, digest_size=16).hexdigest()}"
-
-            return_index = (
-                f"CREATE INDEX IF NOT EXISTS {index_name} "
-                f"ON {san_table_name} ({san_colum_name})"
-            )
-
-        if bits & PRIMARY_BIT:
-            return_sql += " PRIMARY KEY"
-
-        if bits & NOT_NULL_BIT:
-            return_sql += " NOT NULL"
-
-        if bits & UNIQUE_BIT:
-            return_sql += " UNIQUE"
-
-        return return_sql, return_index
-
-    # endregion
+        self._flexible_tables: set[str] = set()
+        self._rollback_flexible_tables: set[str] | None = None
 
     # region table control
     def create_table(
         self,
         table_name: str,
-        *colums: str,
+        *colums: tuple[str | int, str, type | None] | tuple[str | int, str],
         flexible: bool = False,
     ) -> None:
-        index_l = []
-        colums_l = []
+        table_name = normalize_identifier(table_name)
+        check_table_name(table_name)
 
-        san_table_name = san(table_name)
+        colum_sqls: list[str] = []
+        index_sqls: list[str] = []
 
-        if flexible:
-            colums_l.append("_data TEXT")
+        if (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            is not None
+        ):
+            return
+
+        column_cache: dict[str, type | None] = {}
 
         for colum in colums:
-            tmp_sql, tmp_index = self._get_colums_sql_create(
-                colum,
-                table_name,
-                san_table_name,
-            )
-            if tmp_index is not None:
-                index_l.append(tmp_index)
+            if len(colum) == 2:
+                flags, name = colum
+                colum_type = None
 
-            colums_l.append(tmp_sql)
+            else:
+                flags, name, colum_type = colum
+
+            check_column_name(name)
+            colum_sql, index_sql = parse_colum_into_sql(
+                table_name, flags, name, colum_type
+            )
+
+            colum_sqls.append(colum_sql)
+            if index_sql:
+                index_sqls.append(index_sql)
+
+            column_cache[normalize_identifier(name)] = colum_type
+
+        if flexible:
+            colum_sql, _ = parse_colum_into_sql(table_name, 0, "_data", bytes)
+            colum_sqls.append(colum_sql)
+            column_cache["_data"] = bytes
 
         self._conn.execute(
-            f"CREATE TABLE IF NOT EXISTS {san_table_name} ({', '.join(colums_l)})"
+            f"CREATE TABLE {sanitize_identifier(table_name)} ({', '.join(colum_sqls)})"
         )
-        for index in index_l:
-            self._conn.execute(index)
 
-    def rename_table(
-        self,
-        target: str,
-        value: str,
-    ) -> None:
-        self._conn.execute(f"ALTER TABLE {san(target)} RENAME TO {san(value)}")
+        for sql in index_sqls:
+            self._conn.execute(sql)
+
+        self._cache[table_name] = column_cache
+        if flexible:
+            self._flexible_tables.add(table_name)
+
+    def rename_table(self, target: str, value: str) -> None:
+        target, value = normalize_identifiers(target, value)
+        check_table_name(target, value)
+        san_target, san_value = sanitize_identifiers(target, value)
+
+        indexed_columns = []
+
+        for index_name in self.get_table_indexes(target):
+            info = self._conn.execute(
+                f"PRAGMA index_info({sanitize_identifier(index_name)})"
+            ).fetchall()
+
+            if len(info) != 1:
+                continue
+
+            column_name = info[0][2]
+            if column_name is None:
+                continue
+
+            if index_name == get_index_identifier(target, column_name):
+                indexed_columns.append(column_name)
+
+        self._conn.execute(f"ALTER TABLE {san_target} RENAME TO {san_value}")
+
+        for column_name in indexed_columns:
+            old_index = get_index_identifier(target, column_name)
+            new_index = get_index_identifier(value, column_name)
+            san_column = sanitize_identifier(column_name)
+
+            self._conn.execute(f"DROP INDEX {old_index}")
+            self._conn.execute(
+                f"CREATE INDEX {new_index} ON {san_value} ({san_column})"
+            )
 
         if target in self._cache:
             self._cache[value] = self._cache.pop(target)
+
+        if target in self._flexible_tables:
+            self._flexible_tables.remove(target)
+            self._flexible_tables.add(value)
 
     def get_tables(self, include_internal: bool = False) -> list[str]:
         query = "SELECT name FROM sqlite_schema WHERE type = 'table'"
 
         if not include_internal:
-            query += " AND name NOT GLOB 'sqlite_*'"
+            query += " AND name NOT GLOB 'sqlite_*' AND name != '_litecrate_meta'"
 
         query += " ORDER BY name"
 
@@ -116,9 +149,40 @@ class Database:
         self,
         target: str,
     ) -> None:
-        self._conn.execute(f"DROP TABLE IF EXISTS {san(target)}")
-
+        target = normalize_identifier(target)
+        check_table_name(target)
+        self._conn.execute(f"DROP TABLE IF EXISTS {sanitize_identifier(target)}")
         self._cache.pop(target, None)
+        self._flexible_tables.discard(target)
+
+    # endregion
+
+    # region index control
+    def get_table_indexes(self, table_name: str) -> list[str]:
+        table_name = normalize_identifier(table_name)
+        return [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type = 'index' AND tbl_name = ? "
+                "AND name NOT GLOB 'sqlite_autoindex_*' "
+                "ORDER BY name",
+                (table_name,),
+            )
+        ]
+
+    def create_index(self, table_name: str, column_name: str) -> None:
+        table_name, column_name = normalize_identifiers(table_name, column_name)
+        san_table, san_column = sanitize_identifiers(table_name, column_name)
+        self._conn.execute(
+            f"CREATE INDEX {get_index_identifier(table_name, column_name)} ON {san_table} ({san_column})"
+        )
+
+    def remove_index(self, table_name: str, column_name: str) -> None:
+        table_name, column_name = normalize_identifiers(table_name, column_name)
+        self._conn.execute(
+            f"DROP INDEX IF EXISTS {get_index_identifier(table_name, column_name)}"
+        )
 
     # endregion
 
@@ -161,6 +225,9 @@ class Database:
 
         self._conn.execute("BEGIN")
         self._rollback_cache = deepcopy(self._cache)
+        self._rollback_flexible_tables = copy(
+            self._flexible_tables
+        )  # тут можно copy обычное ибо это не ссылки на обьедки
         return self
 
     def __exit__(
@@ -175,13 +242,13 @@ class Database:
         else:
             self._conn.execute("ROLLBACK")
             self._cache = self._rollback_cache  # pyright: ignore[reportAttributeAccessIssue] | Никогда не None
+            self._flexible_tables = self._rollback_flexible_tables  # pyright: ignore[reportAttributeAccessIssue] | Никогда не None
 
         self._rollback_cache = None
+        self._rollback_flexible_tables = None
 
     # endregion
 
-
-# сделать create_table
 
 # сделать insert
 # сделать update
@@ -192,3 +259,5 @@ class Database:
 
 # работа с json (во всвяком случае поддержка json)?
 # кеша немного наверное чтобы понимать куда можем пихнуть произвольный json?
+
+# Сохранение и загрузка кеша из бд. Сейчас кеш бесмысленный ибо умирает как только умирает бд.
