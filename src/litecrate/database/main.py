@@ -35,6 +35,22 @@ class Database:
         self._flexible_tables: set[str] = set()
         self._rollback_flexible_tables: set[str] | None = None
 
+        with self:
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS _litecrate_meta ("
+                "table_name TEXT PRIMARY KEY, "
+                "cache_colums TEXT NOT NULL, "
+                "if_flexible INTEGER NOT NULL"
+                ")"
+            )
+            self._load_cache()
+
+    # region helpers
+    def _load_cache(self) -> None:
+        pass  # TODO: доделать запись и актуализацию кеша
+
+    # endregion
+
     # region table control
     def create_table(
         self,
@@ -79,9 +95,9 @@ class Database:
             column_cache[normalize_identifier(name)] = colum_type
 
         if flexible:
-            colum_sql, _ = parse_colum_into_sql(table_name, 0, "_data", bytes)
+            colum_sql, _ = parse_colum_into_sql(table_name, 0, "_data")
             colum_sqls.append(colum_sql)
-            column_cache["_data"] = bytes
+            column_cache["_data"] = None
 
         self._conn.execute(
             f"CREATE TABLE {sanitize_identifier(table_name)} ({', '.join(colum_sqls)})"
