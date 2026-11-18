@@ -3,6 +3,7 @@ from copy import copy, deepcopy
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self
+from urllib.parse import quote, unquote
 
 from ..utils import (
     check_column_name,
@@ -17,6 +18,17 @@ from ..utils import (
 
 
 class Database:
+    _CACHE_TYPES: dict[str, type | None] = {
+        "None": None,
+        "int": int,
+        "float": float,
+        "str": str,
+        "bool": bool,
+        "bytes": bytes,
+        "dict": dict,
+        "list": list,
+    }
+
     def __init__(
         self,
         db_path: Path | str | Literal[":memory:"],
@@ -47,7 +59,58 @@ class Database:
 
     # region helpers
     def _load_cache(self) -> None:
-        pass  # TODO: доделать запись и актуализацию кеша
+        self._cache.clear()
+        self._flexible_tables.clear()
+
+        rows = self._conn.execute(
+            "SELECT table_name, cache_colums, if_flexible FROM _litecrate_meta"
+        )
+
+        for table_name, cache_colums, if_flexible in rows:
+            columns: dict[str, type | None] = {}
+
+            for entry in filter(None, cache_colums.split(",")):
+                try:
+                    name, type_name = entry.rsplit(":", 1)
+                    columns[unquote(name)] = self._CACHE_TYPES[type_name]
+
+                except (ValueError, KeyError) as exc:
+                    raise ValueError(
+                        f"Invalid cache metadata for table {table_name!r}"
+                    ) from exc
+
+            self._cache[table_name] = columns
+
+            if if_flexible:
+                self._flexible_tables.add(table_name)
+
+    def _save_cache(self, table_name: str) -> None:
+        columns: list[str] = []
+
+        for name, column_type in self._cache[table_name].items():
+            type_name = "None" if column_type is None else column_type.__name__
+
+            if (
+                type_name not in self._CACHE_TYPES
+                or self._CACHE_TYPES[type_name] is not column_type
+            ):
+                raise TypeError(f"Unsupported cache type: {column_type!r}")
+
+            columns.append(f"{quote(name, safe='')}:{type_name}")
+
+        self._conn.execute(
+            "INSERT INTO _litecrate_meta "
+            "(table_name, cache_colums, if_flexible) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(table_name) DO UPDATE SET "
+            "cache_colums = excluded.cache_colums, "
+            "if_flexible = excluded.if_flexible",
+            (
+                table_name,
+                ",".join(columns),
+                int(table_name in self._flexible_tables),
+            ),
+        )
 
     # endregion
 
@@ -110,6 +173,8 @@ class Database:
         if flexible:
             self._flexible_tables.add(table_name)
 
+        self._save_cache(table_name)
+
     def rename_table(self, target: str, value: str) -> None:
         target, value = normalize_identifiers(target, value)
         check_table_name(target, value)
@@ -151,6 +216,11 @@ class Database:
             self._flexible_tables.remove(target)
             self._flexible_tables.add(value)
 
+        self._conn.execute(
+            "UPDATE _litecrate_meta SET table_name = ? WHERE table_name = ?",
+            (value, target),
+        )
+
     def get_tables(self, include_internal: bool = False) -> list[str]:
         query = "SELECT name FROM sqlite_schema WHERE type = 'table'"
 
@@ -170,6 +240,9 @@ class Database:
         self._conn.execute(f"DROP TABLE IF EXISTS {sanitize_identifier(target)}")
         self._cache.pop(target, None)
         self._flexible_tables.discard(target)
+        self._conn.execute(
+            "DELETE FROM _litecrate_meta WHERE table_name = ?", (target,)
+        )
 
     # endregion
 
@@ -241,9 +314,7 @@ class Database:
 
         self._conn.execute("BEGIN")
         self._rollback_cache = deepcopy(self._cache)
-        self._rollback_flexible_tables = copy(
-            self._flexible_tables
-        )  # тут можно copy обычное ибо это не ссылки на обьедки
+        self._rollback_flexible_tables = copy(self._flexible_tables)
         return self
 
     def __exit__(
@@ -257,8 +328,9 @@ class Database:
 
         else:
             self._conn.execute("ROLLBACK")
-            self._cache = self._rollback_cache  # pyright: ignore[reportAttributeAccessIssue] | Никогда не None
-            self._flexible_tables = self._rollback_flexible_tables  # pyright: ignore[reportAttributeAccessIssue] | Никогда не None
+            # Никогда не None
+            self._cache = self._rollback_cache  # pyright: ignore[reportAttributeAccessIssue]
+            self._flexible_tables = self._rollback_flexible_tables  # pyright: ignore[reportAttributeAccessIssue]
 
         self._rollback_cache = None
         self._rollback_flexible_tables = None
