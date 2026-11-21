@@ -1,5 +1,5 @@
 import sqlite3
-from copy import copy, deepcopy
+from copy import deepcopy
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self
@@ -44,15 +44,11 @@ class Database:
         self._cache: dict[str, dict[str, type | None]] = {}
         self._rollback_cache: dict[str, dict[str, type | None]] | None = None
 
-        self._flexible_tables: set[str] = set()
-        self._rollback_flexible_tables: set[str] | None = None
-
         with self:
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS _litecrate_meta ("
                 "table_name TEXT PRIMARY KEY, "
-                "cache_colums TEXT NOT NULL, "
-                "if_flexible INTEGER NOT NULL"
+                "cache_colums TEXT NOT NULL"
                 ")"
             )
             self._load_cache()
@@ -60,13 +56,12 @@ class Database:
     # region helpers
     def _load_cache(self) -> None:
         self._cache.clear()
-        self._flexible_tables.clear()
 
         rows = self._conn.execute(
-            "SELECT table_name, cache_colums, if_flexible FROM _litecrate_meta"
+            "SELECT table_name, cache_colums FROM _litecrate_meta"
         )
 
-        for table_name, cache_colums, if_flexible in rows:
+        for table_name, cache_colums in rows:
             columns: dict[str, type | None] = {}
 
             for entry in filter(None, cache_colums.split(",")):
@@ -80,9 +75,6 @@ class Database:
                     ) from exc
 
             self._cache[table_name] = columns
-
-            if if_flexible:
-                self._flexible_tables.add(table_name)
 
     def _save_cache(self, table_name: str) -> None:
         columns: list[str] = []
@@ -100,15 +92,13 @@ class Database:
 
         self._conn.execute(
             "INSERT INTO _litecrate_meta "
-            "(table_name, cache_colums, if_flexible) "
-            "VALUES (?, ?, ?) "
+            "(table_name, cache_colums) "
+            "VALUES (?, ?) "
             "ON CONFLICT(table_name) DO UPDATE SET "
-            "cache_colums = excluded.cache_colums, "
-            "if_flexible = excluded.if_flexible",
+            "cache_colums = excluded.cache_colums",
             (
                 table_name,
                 ",".join(columns),
-                int(table_name in self._flexible_tables),
             ),
         )
 
@@ -170,9 +160,6 @@ class Database:
             self._conn.execute(sql)
 
         self._cache[table_name] = column_cache
-        if flexible:
-            self._flexible_tables.add(table_name)
-
         self._save_cache(table_name)
 
     def rename_table(self, target: str, value: str) -> None:
@@ -212,10 +199,6 @@ class Database:
         if target in self._cache:
             self._cache[value] = self._cache.pop(target)
 
-        if target in self._flexible_tables:
-            self._flexible_tables.remove(target)
-            self._flexible_tables.add(value)
-
         self._conn.execute(
             "UPDATE _litecrate_meta SET table_name = ? WHERE table_name = ?",
             (value, target),
@@ -239,7 +222,6 @@ class Database:
         check_table_name(target)
         self._conn.execute(f"DROP TABLE IF EXISTS {sanitize_identifier(target)}")
         self._cache.pop(target, None)
-        self._flexible_tables.discard(target)
         self._conn.execute(
             "DELETE FROM _litecrate_meta WHERE table_name = ?", (target,)
         )
@@ -314,7 +296,6 @@ class Database:
 
         self._conn.execute("BEGIN")
         self._rollback_cache = deepcopy(self._cache)
-        self._rollback_flexible_tables = copy(self._flexible_tables)
         return self
 
     def __exit__(
@@ -328,12 +309,9 @@ class Database:
 
         else:
             self._conn.execute("ROLLBACK")
-            # Никогда не None
-            self._cache = self._rollback_cache  # pyright: ignore[reportAttributeAccessIssue]
-            self._flexible_tables = self._rollback_flexible_tables  # pyright: ignore[reportAttributeAccessIssue]
+            self._cache = self._rollback_cache  # pyright: ignore[reportAttributeAccessIssue] | Никогда не None
 
         self._rollback_cache = None
-        self._rollback_flexible_tables = None
 
     # endregion
 
