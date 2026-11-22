@@ -1,6 +1,6 @@
 import pytest
 
-from src.litecrate.utils.identifier import check_column_name
+from litecrate.utils.identifier import check_column_name
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,6 @@
 import pytest
 
-from src.litecrate.utils.identifier import check_table_name
+from litecrate.utils.identifier import check_table_name
 
 
 @pytest.mark.parametrize(

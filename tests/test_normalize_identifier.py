@@ -1,7 +1,7 @@
 
 import pytest
 
-from src.litecrate.utils.identifier import normalize_identifier
+from litecrate.utils.identifier import normalize_identifier
 
 
 @pytest.mark.parametrize(

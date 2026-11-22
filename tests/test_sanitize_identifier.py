@@ -1,6 +1,6 @@
 import pytest
 
-from src.litecrate.utils.identifier import sanitize_identifier
+from litecrate.utils.identifier import sanitize_identifier
 
 
 @pytest.mark.parametrize(
