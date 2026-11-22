@@ -4,5 +4,5 @@ title: Main
 ---
 
 # Language selection
-[eng]()
-rus
+[eng](eng/index.md)
+[rus](rus/index.md)
