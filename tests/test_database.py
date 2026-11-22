@@ -501,6 +501,7 @@ def test_journal_mode_and_auto_vacuum_persist(tmp_path: Path):
         database.set_journal_mode("WAL")
         database.set_auto_vacuum("FULL")
         database.vacuum()
+
     with closing(sqlite3.connect(path)) as raw:
         assert raw.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert raw.execute("PRAGMA auto_vacuum").fetchone() == (1,)
@@ -515,6 +516,49 @@ def test_invalid_pragmas_and_unavailable_wal(db: Database):
 
     with pytest.raises(RuntimeError):
         db.set_journal_mode("WAL")
+
+
+def test_incremental_vacuum_frees_pages(tmp_path: Path):
+    path = tmp_path / "vacuum.sqlite3"
+
+    with closing(Database(path)) as db:
+        db.set_auto_vacuum("INCREMENTAL")
+        db.vacuum()
+
+        db.create_table(
+            "payloads",
+            ("p", "id", int),
+            (0, "payload", bytes),
+        )
+
+        for _ in range(20):
+            db.insert("payloads", payload=b"x" * 4096)
+
+        db.delete("payloads", "1")
+
+        before = db._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert before > 2
+
+        db.incremental_vacuum(2)
+
+        after_limit = db._conn.execute("PRAGMA freelist_count").fetchone()[0]
+
+        assert before - 2 <= after_limit < before
+
+        db.incremental_vacuum()
+
+        after_all = db._conn.execute("PRAGMA freelist_count").fetchone()[0]
+
+        assert after_all == 0
+
+
+@pytest.mark.parametrize(
+    "pages",
+    [0, -1, True, 1.5, "10"],
+)
+def test_incremental_vacuum_invalid_pages(db: Database, pages):
+    with pytest.raises(ValueError, match="Pages"):
+        db.incremental_vacuum(pages)
 
 
 def test_close_releases_connection():

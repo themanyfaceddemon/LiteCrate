@@ -792,6 +792,19 @@ class Database:
                 f"Failed to set journal mode to {value!r}, got {result!r}"
             )
 
+    def incremental_vacuum(self, pages: int | None = None) -> None:
+        if pages is not None and (type(pages) is not int or pages <= 0):
+            raise ValueError("Pages must be a positive integer")
+
+        query = "PRAGMA incremental_vacuum"
+
+        if pages is not None:
+            query += f"({pages})"
+
+        # Incremental vacuum requires stepping through the entire statement
+        for _ in self._conn.execute(query):
+            pass
+
     # endregion
 
     def vacuum(self) -> None:
