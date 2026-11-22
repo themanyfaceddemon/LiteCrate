@@ -4,7 +4,7 @@ import time
 
 from litecrate import Database
 
-ROUNDS = 5
+ROUNDS = 50
 
 
 def benchmark_litecrate(count: int, separate_transactions: bool) -> float:
@@ -21,8 +21,7 @@ def benchmark_litecrate(count: int, separate_transactions: bool) -> float:
 
     if separate_transactions:
         for i in range(count):
-            with db:
-                db.insert("users", login=f"user_{i}", password="hash")
+            db.insert("users", login=f"user_{i}", password="hash")
 
     else:
         with db:
@@ -46,9 +45,7 @@ def benchmark_sqlite(count: int, separate_transactions: bool) -> float:
 
     if separate_transactions:
         for i in range(count):
-            conn.execute("BEGIN")
             conn.execute(query, (f"user_{i}", "hash"))
-            conn.execute("COMMIT")
 
     else:
         conn.execute("BEGIN")
@@ -90,4 +87,4 @@ def run(count: int, separate_transactions: bool) -> None:
 
 if __name__ == "__main__":
     run(10_000, separate_transactions=False)
-    run(1_000, separate_transactions=True)
+    run(10_000, separate_transactions=True)
