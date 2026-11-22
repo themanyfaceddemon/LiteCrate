@@ -21,6 +21,12 @@ from ..utils import (
 
 
 class Database:
+    """A lightweight SQLite interface with typed columns and flexible JSON fields.
+
+    Schema metadata is stored in the database, and transactions are managed
+    explicitly using ``with db:``.
+    """
+
     _QUERY_TOKENS = re.compile(
         r"(?P<comment>--[^\n]*|/\*.*?(?:\*/|\Z))"
         r"|(?P<literal>[xX]?'(?:''|[^'])*(?:'|\Z))"
@@ -132,6 +138,16 @@ class Database:
         db_path: Path | str | Literal[":memory:"],
         timeout: float = 30.0,
     ) -> None:
+        """Open a SQLite database and load LiteCrate schema metadata.
+
+        Args:
+            db_path: Database file path, or ``":memory:"`` for an in-memory database.
+            timeout: Seconds to wait when the database is locked.
+
+        The connection uses autocommit outside explicit transactions. Access
+        from multiple threads requires external synchronization.
+        """
+
         self._conn = sqlite3.connect(
             str(db_path),
             timeout=timeout,
@@ -159,6 +175,8 @@ class Database:
 
     # region helpers
     def _load_cache(self) -> None:
+        """Restore declared column types from the internal metadata table."""
+
         self._cache.clear()
 
         rows = self._conn.execute(
@@ -181,6 +199,8 @@ class Database:
             self._cache[table_name] = columns
 
     def _save_cache(self, table_name: str) -> None:
+        """Persist the cached column types for a table in SQLite."""
+
         columns: list[str] = []
 
         for name, column_type in self._cache[table_name].items():
@@ -208,6 +228,8 @@ class Database:
 
     @staticmethod
     def _dump_json(value: object) -> str:
+        """Serialize a value as compact, strict JSON without ASCII escaping."""
+
         return json.dumps(
             value,
             ensure_ascii=False,
@@ -217,11 +239,15 @@ class Database:
 
     @staticmethod
     def _json_path(name: str) -> str:
+        """Encode a field name as a single top-level SQLite JSON path key."""
+
         label = json.dumps(name, ensure_ascii=False)[1:-1].replace(r"\"", r"\u0022")
         return f'$."{label}"'
 
     @staticmethod
     def _local_subqueries(tokens: list[re.Match[str]]) -> set[int]:
+        """Locate subqueries whose local identifiers must not be rewritten."""
+
         groups: list[int] = []
         local: set[int] = set()
         for i, token in enumerate(tokens):
@@ -245,6 +271,12 @@ class Database:
     @classmethod
     @lru_cache(maxsize=128)
     def _query_parts(cls, query: str) -> tuple[tuple[int, int, str | int], ...]:
+        """Parse reusable SQL token spans for bind parameters and field names.
+
+        String literals and comments are excluded from identifier rewriting.
+        The result is cached by the original condition string.
+        """
+
         tokens = [
             token
             for token in cls._QUERY_TOKENS.finditer(query)
@@ -329,6 +361,13 @@ class Database:
         return tuple(parts)
 
     def _expand_query(self, table_name: str, query: str, bind_offset: int = 0) -> str:
+        """Rewrite eligible flexible-field references and adjust bind indexes.
+
+        Declared columns remain unchanged; unqualified extra fields are read
+        from ``_data``. ``bind_offset`` accounts for parameters preceding the
+        WHERE clause, such as values assigned by UPDATE.
+        """
+
         columns = self._cache.get(table_name)
         if columns is not None and "_data" not in columns:
             columns = None
@@ -367,6 +406,12 @@ class Database:
         table_name: str,
         values: dict[str, object],
     ) -> tuple[dict[str, object], dict[str, object]]:
+        """Validate input fields and separate declared columns from JSON extras.
+
+        Declared ``dict`` and ``list`` values are serialized for SQLite.
+        Unknown fields are accepted only for tables with flexible storage.
+        """
+
         columns = self._cache.get(table_name)
 
         if columns is None:
@@ -410,6 +455,11 @@ class Database:
         table_name: str,
         row: dict[str, object],
     ) -> dict[str, object]:
+        """Restore typed values and merge flexible JSON fields into a result row.
+
+        The internal ``_data`` column is omitted from the returned dictionary.
+        """
+
         columns = self._cache.get(table_name)
         if columns is None:
             return row
@@ -459,6 +509,17 @@ class Database:
         *colums: tuple[str | int, str, type | None] | tuple[str | int, str],
         flexible: bool = False,
     ) -> None:
+        """Create a table from column definitions if it does not already exist.
+
+        Args:
+            table_name: Name of the table to create.
+            *colums: ``(flags, name)`` or ``(flags, name, python_type)`` tuples.
+            flexible: Store undeclared fields in the internal JSON column.
+
+        Existing tables are left untouched, even if their definitions differ.
+        The flags are interpreted by ``parse_colum_into_sql``.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
 
@@ -514,6 +575,13 @@ class Database:
         self._save_cache(table_name)
 
     def rename_table(self, target: str, value: str) -> None:
+        """Rename a table, its metadata, and LiteCrate-generated indexes.
+
+        Args:
+            target: Current table name.
+            value: New table name.
+        """
+
         target, value = normalize_identifiers(target, value)
         check_table_name(target, value)
         san_target, san_value = sanitize_identifiers(target, value)
@@ -557,6 +625,12 @@ class Database:
         )
 
     def get_tables(self, include_internal: bool = False) -> list[str]:
+        """Return sorted table names, optionally including SQLite internal tables.
+
+        Args:
+            include_internal: Include ``sqlite_*`` and LiteCrate metadata tables.
+        """
+
         query = "SELECT name FROM sqlite_schema WHERE type = 'table'"
 
         if not include_internal:
@@ -570,6 +644,8 @@ class Database:
         self,
         target: str,
     ) -> None:
+        """Drop a table and its cached metadata if present."""
+
         target = normalize_identifier(target)
         check_table_name(target)
         self._conn.execute(f"DROP TABLE IF EXISTS {sanitize_identifier(target)}")
@@ -586,6 +662,15 @@ class Database:
         table_name: str,
         **values: object,
     ) -> int | None:
+        """Insert a row using keyword arguments for its field values.
+
+        Undeclared fields are accepted only in flexible tables and stored as
+        JSON. An empty ``values`` mapping inserts a row of default values.
+
+        Returns:
+            The SQLite ``lastrowid``, or ``None`` if unavailable.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
@@ -615,6 +700,21 @@ class Database:
         *args: object,
         **values: object,
     ) -> int:
+        """Update matching rows with the supplied field values.
+
+        Args:
+            table_name: Table to modify.
+            query: SQL condition without ``WHERE``; must not be empty.
+            *args: Values bound to placeholders in ``query``.
+            **values: Fields to update; at least one is required.
+
+        Flexible JSON keys are updated individually. A new dictionary or list
+        replaces the complete value of that field, not its nested contents.
+
+        Returns:
+            Number of affected rows.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
@@ -658,6 +758,17 @@ class Database:
         query: str,
         *args: object,
     ) -> int:
+        """Delete rows matching a non-empty SQL condition.
+
+        Args:
+            table_name: Table to modify.
+            query: SQL condition without ``WHERE``; use ``"1"`` for all rows.
+            *args: Values bound to placeholders in ``query``.
+
+        Returns:
+            Number of deleted rows.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
@@ -677,6 +788,19 @@ class Database:
         query: str = "",
         *args: object,
     ) -> list[dict[str, object]]:
+        """Return all rows matching an optional SQL condition.
+
+        Args:
+            table_name: Table to read.
+            query: SQL condition without ``WHERE``; empty means all rows.
+            *args: Values bound to placeholders in ``query``.
+
+        Declared types and flexible JSON fields are restored in each result.
+
+        Returns:
+            A list of row dictionaries, or an empty list if none match.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
@@ -695,6 +819,12 @@ class Database:
         query: str = "",
         *args: object,
     ) -> dict[str, object] | None:
+        """Return one matching row as a dictionary, or ``None`` if absent.
+
+        The optional ``query`` and ``args`` work as in ``select``. Without an
+        ordering guarantee, any one of multiple matching rows may be returned.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
@@ -717,6 +847,17 @@ class Database:
         query: str = "",
         *args: object,
     ) -> int:
+        """Count rows matching an optional SQL condition.
+
+        Args:
+            table_name: Table to read.
+            query: SQL condition without ``WHERE``; empty means all rows.
+            *args: Values bound to placeholders in ``query``.
+
+        Returns:
+            Number of matching rows.
+        """
+
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
@@ -731,6 +872,8 @@ class Database:
 
     # region index control
     def get_table_indexes(self, table_name: str) -> list[str]:
+        """Return sorted index names, excluding SQLite's automatic indexes."""
+
         table_name = normalize_identifier(table_name)
         return [
             row[0]
@@ -744,6 +887,12 @@ class Database:
         ]
 
     def create_index(self, table_name: str, column_name: str) -> None:
+        """Create a named index on an existing SQLite column.
+
+        This does not check for redundant indexes. SQLite raises an error
+        if the generated index name is already in use.
+        """
+
         table_name, column_name = normalize_identifiers(table_name, column_name)
         san_table, san_column = sanitize_identifiers(table_name, column_name)
         # SQLite builds can interpret a double-quoted missing column as text
@@ -761,6 +910,8 @@ class Database:
         )
 
     def remove_index(self, table_name: str, column_name: str) -> None:
+        """Drop the LiteCrate-named index for a column if it exists."""
+
         table_name, column_name = normalize_identifiers(table_name, column_name)
         self._conn.execute(
             f"DROP INDEX IF EXISTS {get_index_identifier(table_name, column_name)}"
@@ -773,6 +924,13 @@ class Database:
         self,
         value: Literal["NONE", "FULL", "INCREMENTAL"],
     ) -> None:
+        """Set SQLite's ``auto_vacuum`` mode.
+
+        Accepted values are ``NONE``, ``FULL``, and ``INCREMENTAL``. Changing
+        an existing database between ``NONE`` and another mode requires
+        a subsequent ``vacuum()`` to take effect.
+        """
+
         if value not in ("NONE", "FULL", "INCREMENTAL"):
             raise ValueError(f"Invalid auto_vacuum value: {value!r}")
 
@@ -782,6 +940,13 @@ class Database:
         self,
         value: Literal["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"],
     ) -> None:
+        """Set SQLite's journal mode and verify the selected mode took effect.
+
+        Raises:
+            ValueError: If the mode name is unsupported.
+            RuntimeError: If SQLite reports a different journal mode.
+        """
+
         if value not in ("DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"):
             raise ValueError(f"Invalid journal_mode value: {value!r}")
 
@@ -793,6 +958,15 @@ class Database:
             )
 
     def incremental_vacuum(self, pages: int | None = None) -> None:
+        """Reclaim free pages when SQLite uses incremental auto-vacuum.
+
+        Args:
+            pages: Maximum pages to reclaim; ``None`` requests all available
+                pages. A positive integer is required when specified.
+
+        This operation has no effect unless ``auto_vacuum`` is ``INCREMENTAL``.
+        """
+
         if pages is not None and (type(pages) is not int or pages <= 0):
             raise ValueError("Pages must be a positive integer")
 
@@ -808,13 +982,29 @@ class Database:
     # endregion
 
     def vacuum(self) -> None:
+        """Rebuild the database using SQLite's ``VACUUM`` command.
+
+        This cannot run inside an active transaction.
+        """
+
         self._conn.execute("VACUUM")
 
     def close(self) -> None:
+        """Close the underlying SQLite connection."""
+
         self._conn.close()
 
     # region context funcs
     def __enter__(self) -> Self:
+        """Begin a transaction and snapshot the schema cache for rollback.
+
+        Returns:
+            This database instance.
+
+        Raises:
+            RuntimeError: If a transaction is already active.
+        """
+
         if self._rollback_cache is not None:
             raise RuntimeError("Nested transactions are not supported")
 
@@ -829,6 +1019,12 @@ class Database:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        """Commit on success, or roll back SQL and cached schema changes.
+
+        A failed commit also triggers rollback. Exceptions are propagated to
+        the caller rather than suppressed.
+        """
+
         snapshot = self._rollback_cache
         if snapshot is None:
             raise RuntimeError("No active transaction")
