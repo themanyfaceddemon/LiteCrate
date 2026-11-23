@@ -78,6 +78,32 @@ def test_primary_unique_and_not_null_constraints(db: Database):
     assert db.select("users") == [{"id": 1, "login": "alice"}]
 
 
+@pytest.mark.parametrize(
+    "flags",
+    ["A", ColumBitEnum.AUTOINCREMENT | ColumBitEnum.INDEX | ColumBitEnum.NOT_NULL],
+)
+def test_autoincrement_survives_deletion_and_reopen(tmp_path: Path, flags: str | int):
+    path = tmp_path / "events.sqlite"
+    with closing(Database(path)) as db:
+        db.create_table("events", (flags, "id", int))
+        assert db.get_table_indexes("events") == []
+        assert db.insert("events") == 1
+        assert db.insert("events", id=10) == 10
+        assert db.delete_all("events") == 2
+
+    with closing(Database(path)) as db:
+        assert db.insert("events") == 11
+        assert db.select("events") == [{"id": 11}]
+
+
+@pytest.mark.parametrize("colum_type", [None, bool, str, dict])
+def test_autoincrement_requires_int(db: Database, colum_type: type | None):
+    with pytest.raises(ValueError, match="AUTOINCREMENT.*int"):
+        db.create_table("events", ("pa", "id", colum_type))
+
+    assert db.get_tables() == []
+
+
 def test_explicit_index_flag_is_redundant_on_primary_and_unique_columns(db: Database):
     db.create_table(
         "users",
@@ -344,6 +370,19 @@ def test_writes_require_a_condition(items: Database, condition: str):
 def test_update_requires_values(items: Database):
     with pytest.raises(ValueError, match="value"):
         items.update("items", "id = 1")
+    with pytest.raises(ValueError, match="value"):
+        items.update_all("items")
+
+
+def test_update_and_delete_all_rows(items: Database):
+    assert items.update_all("ITEMS", label="changed", tags=["new"]) == 3
+    updated = [(row["label"], row["tags"]) for row in items.select("items")]
+    assert updated == [("changed", ["new"])] * 3
+    assert items.count("items", "score = ?", 8) == 1
+    assert items.delete_all("ITEMS") == 3
+    assert items.select("items") == []
+    assert items.update_all("items", label="changed") == 0
+    assert items.delete_all("items") == 0
 
 
 def test_many_json_fields_fit_one_update(items: Database):
@@ -534,7 +573,7 @@ def test_incremental_vacuum_frees_pages(tmp_path: Path):
         for _ in range(20):
             db.insert("payloads", payload=b"x" * 4096)
 
-        db.delete("payloads", "1")
+        db.delete_all("payloads")
 
         before = db._conn.execute("PRAGMA freelist_count").fetchone()[0]
         assert before > 2

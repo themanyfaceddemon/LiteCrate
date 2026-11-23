@@ -43,7 +43,7 @@ Escaping identifiers does not replace parameterization of **values**: use `?` fo
 
 | Function or type | Purpose |
 |---|---|
-| `ColumBitEnum` | An `IntFlag` with `INDEX`, `NOT_NULL`, `PRIMARY`, and `UNIQUE` values. |
+| `ColumBitEnum` | An `IntFlag` with `INDEX`, `NOT_NULL`, `PRIMARY`, `UNIQUE`, and `AUTOINCREMENT` values. |
 | `ColumBitEnum.all_flags()` | Return the combined flag mask. |
 | `get_index_identifier(table, colum)` | Generate an index name for a table/column pair. |
 | `parse_colum_into_sql(table_name, flags, colum_name, colum_type=None)` | Return `(column_sql, index_sql)`; the second item is `None` if no separate index is needed. |

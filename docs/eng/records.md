@@ -65,11 +65,15 @@ The method returns the number of affected rows, or `0` if no rows match. You mus
 removed = db.delete("players", "login = ?", "ada")
 ```
 
-A condition is required. To explicitly update or delete **all** rows, you can pass the expression `"1"`:
+A non-empty condition is required.
+
+## Updating or deleting all records
+
+Use `update_all(table_name, **values)` or `delete_all(table_name)` to target every row. Both methods return the number of affected rows. `update_all()` requires at least one new value.
 
 ```python
-db.update("players", "1", level=0)
-db.delete("players", "1")
+changed = db.update_all("players", level=0)
+removed = db.delete_all("players")
 ```
 
 ## Errors and limitations

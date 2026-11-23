@@ -12,6 +12,7 @@ class ColumBitEnum(IntFlag):
     NOT_NULL = 1 << 1
     PRIMARY = 1 << 2
     UNIQUE = 1 << 3
+    AUTOINCREMENT = 1 << 4
 
     @staticmethod
     def all_flags() -> int:
@@ -59,6 +60,10 @@ def _sanitize_flags(flags: str | int) -> int:
                     bit_mask |= ColumBitEnum.UNIQUE
                     continue
 
+                elif char == "a":
+                    bit_mask |= ColumBitEnum.AUTOINCREMENT
+                    continue
+
                 else:
                     raise ValueError(f"Unknown column flag {char!r} in {flags!r}")
 
@@ -67,6 +72,9 @@ def _sanitize_flags(flags: str | int) -> int:
 
     if bit_mask & ~ColumBitEnum.all_flags():
         raise ValueError(f"Invalid column flag mask: {flags!r}")
+
+    if bit_mask & ColumBitEnum.AUTOINCREMENT:
+        bit_mask |= ColumBitEnum.PRIMARY
 
     if bit_mask & ColumBitEnum.PRIMARY:
         bit_mask &= ~(ColumBitEnum.INDEX | ColumBitEnum.UNIQUE)
@@ -87,6 +95,9 @@ def parse_colum_into_sql(
     san_table_name, san_colum_name = sanitize_identifiers(table_name, colum_name)
 
     flags = _sanitize_flags(flags)
+    if flags & ColumBitEnum.AUTOINCREMENT and colum_type is not int:
+        raise ValueError("AUTOINCREMENT requires a column of type int")
+
     type_sql = _get_colum_type(colum_type)
 
     # region index sql create
@@ -99,6 +110,9 @@ def parse_colum_into_sql(
     colum_sql = f"{san_colum_name} {type_sql}".rstrip()
     if flags & ColumBitEnum.PRIMARY:
         colum_sql += " PRIMARY KEY"
+
+    if flags & ColumBitEnum.AUTOINCREMENT:
+        colum_sql += " AUTOINCREMENT"
 
     if flags & ColumBitEnum.NOT_NULL:
         colum_sql += " NOT NULL"

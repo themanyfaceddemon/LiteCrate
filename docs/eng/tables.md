@@ -39,10 +39,13 @@ Flags can be supplied as a string in any order and case. Use `0` or `""` for a c
 | `n` | Disallow `NULL` (`NOT NULL`). |
 | `p` | Make the column a primary key (`PRIMARY KEY`). |
 | `u` | Add a uniqueness constraint (`UNIQUE`). |
+| `a` | Make an `int` column an `INTEGER PRIMARY KEY AUTOINCREMENT`. |
 
 For example, `("un", "login", str)` defines a required, unique login.
 
-When creating a table, LiteCrate does not create a separate `i` index if the same column is already marked with `u` or `p`. See [Indexes](indexes.md).
+Use `("a", "id", int)` to keep automatically assigned IDs increasing after rows are deleted. The `a` flag includes `p` and requires the Python type `int`.
+
+When creating a table, LiteCrate does not create a separate `i` index if the same column is already marked with `u`, `p`, or `a`. See [Indexes](indexes.md).
 
 **SQLite detail:** in an ordinary table, a non-integer primary key does not always prohibit `NULL`. If the value is required, explicitly add `n`, for example `("pn", "code", str)`. An integer `("p", "id", int)` is used as an `INTEGER PRIMARY KEY`, for which SQLite can assign an identifier automatically.
 

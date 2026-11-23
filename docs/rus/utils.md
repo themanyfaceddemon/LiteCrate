@@ -43,7 +43,7 @@ print(sanitize_identifier(name))
 
 | Функция или тип | Назначение |
 |---|---|
-| `ColumBitEnum` | `IntFlag` со значениями `INDEX`, `NOT_NULL`, `PRIMARY`, `UNIQUE`. |
+| `ColumBitEnum` | `IntFlag` со значениями `INDEX`, `NOT_NULL`, `PRIMARY`, `UNIQUE`, `AUTOINCREMENT`. |
 | `ColumBitEnum.all_flags()` | Возвращает общую маску флагов. |
 | `get_index_identifier(table, colum)` | Формирует имя индекса для пары таблица/колонка. |
 | `parse_colum_into_sql(table_name, flags, colum_name, colum_type=None)` | Возвращает `(column_sql, index_sql)`; второй элемент - `None`, если отдельный индекс не нужен. |

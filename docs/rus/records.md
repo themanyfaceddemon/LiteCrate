@@ -65,11 +65,15 @@ changed = db.update("players", "login = ?", "ada", level=10)
 removed = db.delete("players", "login = ?", "ada")
 ```
 
-Условие обязательно. Если необходимо явно изменить или удалить **все** строки, можно передать выражение `"1"`:
+Непустое условие обязательно.
+
+## Обновление и удаление всех записей
+
+Чтобы изменить или удалить все строки таблицы, используй `update_all(table_name, **values)` или `delete_all(table_name)`. Оба метода возвращают количество затронутых строк. Для `update_all()` нужно передать хотя бы одно новое значение.
 
 ```python
-db.update("players", "1", level=0)
-db.delete("players", "1")
+changed = db.update_all("players", level=0)
+removed = db.delete_all("players")
 ```
 
 ## Ошибки и ограничения

@@ -715,12 +715,26 @@ class Database:
             Number of affected rows.
         """
 
+        if not query.strip():
+            raise ValueError("UPDATE requires a WHERE condition")
+
+        return self._update(table_name, query, args, values)
+
+    def update_all(self, table_name: str, **values: object) -> int:
+        """Update the supplied fields in every row and return the affected count."""
+
+        return self._update(table_name, None, (), values)
+
+    def _update(
+        self,
+        table_name: str,
+        query: str | None,
+        args: tuple[object, ...],
+        values: dict[str, object],
+    ) -> int:
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
         san_table = sanitize_identifier(table_name)
-
-        if not query.strip():
-            raise ValueError("UPDATE requires a WHERE condition")
 
         if not values:
             raise ValueError("UPDATE requires at least one value")
@@ -745,11 +759,12 @@ class Database:
 
             assignments.append(f'"_data" = {data_sql}')
 
-        condition = self._expand_query(table_name, query, bind_offset=len(params))
-        cursor = self._conn.execute(
-            f"UPDATE {san_table} SET {', '.join(assignments)} WHERE {condition}",
-            (*params, *args),
-        )
+        sql = f"UPDATE {san_table} SET {', '.join(assignments)}"
+        if query is not None:
+            condition = self._expand_query(table_name, query, bind_offset=len(params))
+            sql += f" WHERE {condition}"
+
+        cursor = self._conn.execute(sql, (*params, *args))
         return cursor.rowcount
 
     def delete(
@@ -762,24 +777,32 @@ class Database:
 
         Args:
             table_name: Table to modify.
-            query: SQL condition without ``WHERE``; use ``"1"`` for all rows.
+            query: SQL condition without ``WHERE``; must not be empty.
             *args: Values bound to placeholders in ``query``.
 
         Returns:
             Number of deleted rows.
         """
 
-        table_name = normalize_identifier(table_name)
-        check_table_name(table_name)
-        san_table = sanitize_identifier(table_name)
-
         if not query.strip():
             raise ValueError("DELETE requires a WHERE condition")
 
-        cursor = self._conn.execute(
-            f"DELETE FROM {san_table} WHERE {self._expand_query(table_name, query)}",
-            args,
-        )
+        return self._delete(table_name, query, args)
+
+    def delete_all(self, table_name: str) -> int:
+        """Delete every row in the table and return the number of deleted rows."""
+
+        return self._delete(table_name, None, ())
+
+    def _delete(self, table_name: str, query: str | None, args: tuple[object, ...]) -> int:
+        table_name = normalize_identifier(table_name)
+        check_table_name(table_name)
+
+        sql = f"DELETE FROM {sanitize_identifier(table_name)}"
+        if query is not None:
+            sql += f" WHERE {self._expand_query(table_name, query)}"
+
+        cursor = self._conn.execute(sql, args)
         return cursor.rowcount
 
     def select(
