@@ -1,4 +1,4 @@
-from .colum_work import ColumBitEnum, parse_colum_into_sql
+from .colum_work import parse_colum_into_sql
 from .identifier import (
     check_column_name,
     check_table_name,
@@ -10,7 +10,6 @@ from .identifier import (
 )
 
 __all__ = [
-    "ColumBitEnum",
     "check_column_name",
     "check_table_name",
     "get_index_identifier",

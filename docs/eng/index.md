@@ -26,7 +26,6 @@ The library uses only the Python standard library and requires Python 3.13 or ne
 - [Flexible fields and JSON](flexible.md) - additional fields, storage, and searching.
 - [Connections and transactions](transactions.md) - connecting to a database, committing changes, and rolling back.
 - [Settings and maintenance](settings.md) - journaling, `auto_vacuum`, `VACUUM`, and related operations.
-- [Utilities](utils.md) - helpers for identifiers and SQL schema generation.
 
 ## Links
 

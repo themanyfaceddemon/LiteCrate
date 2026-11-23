@@ -125,7 +125,7 @@ Additional fields support JSON-compatible values: strings, finite numbers, `bool
 Keep these details in mind when working with flexible fields:
 
 - **`None` and missing fields.** `None` is stored as JSON `null`. Missing fields are not included in the returned dictionary. A `field IS NULL` condition may match both cases.
-- **Indexes and constraints.** Flexible fields do not receive individual indexes or `UNIQUE` or `NOT NULL` constraints. If you need those properties, declare the field as a regular column.
+- **Indexes and constraints.** An extra top-level field can have an [index](indexes.md#flexible-field-indexes). Use regular columns for `UNIQUE` and `NOT NULL` constraints.
 - **Binary data.** The `bytes` type is not supported in JSON. Use a separate column for binary data.
 
 For more on declaring columns, see [Tables and data types](tables.md).

@@ -1,22 +1,16 @@
-from enum import IntFlag
-
 from .identifier import (
     get_index_identifier,
     normalize_identifiers,
     sanitize_identifiers,
 )
 
-
-class ColumBitEnum(IntFlag):
-    INDEX = 1 << 0
-    NOT_NULL = 1 << 1
-    PRIMARY = 1 << 2
-    UNIQUE = 1 << 3
-    AUTOINCREMENT = 1 << 4
-
-    @staticmethod
-    def all_flags() -> int:
-        return sum(flag.value for flag in ColumBitEnum)
+_INDEX = 1 << 0
+_NOT_NULL = 1 << 1
+_PRIMARY = 1 << 2
+_UNIQUE = 1 << 3
+_AUTOINCREMENT = 1 << 4
+_FLAGS = {"i": _INDEX, "n": _NOT_NULL, "p": _PRIMARY, "u": _UNIQUE, "a": _AUTOINCREMENT}
+_ALL_FLAGS = sum(_FLAGS.values())
 
 
 _SQL_TYPES = {
@@ -39,48 +33,33 @@ def _get_colum_type(colum_type: type | None) -> str:
 def _sanitize_flags(flags: str | int) -> int:
     match flags:
         case int():
-            bit_mask = flags
+            bit_mask = int(flags)
 
         case str():
             bit_mask = 0
             for char in flags.lower():
-                if char == "p":
-                    bit_mask |= ColumBitEnum.PRIMARY
-                    continue
+                try:
+                    bit_mask |= _FLAGS[char]
 
-                elif char == "i":
-                    bit_mask |= ColumBitEnum.INDEX
-                    continue
-
-                elif char == "n":
-                    bit_mask |= ColumBitEnum.NOT_NULL
-                    continue
-
-                elif char == "u":
-                    bit_mask |= ColumBitEnum.UNIQUE
-                    continue
-
-                elif char == "a":
-                    bit_mask |= ColumBitEnum.AUTOINCREMENT
-                    continue
-
-                else:
-                    raise ValueError(f"Unknown column flag {char!r} in {flags!r}")
+                except KeyError:
+                    raise ValueError(
+                        f"Unknown column flag {char!r} in {flags!r}"
+                    ) from None
 
         case _:
             raise TypeError(f"Flags must be str or int, got {type(flags).__name__}")
 
-    if bit_mask & ~ColumBitEnum.all_flags():
+    if bit_mask & ~_ALL_FLAGS:
         raise ValueError(f"Invalid column flag mask: {flags!r}")
 
-    if bit_mask & ColumBitEnum.AUTOINCREMENT:
-        bit_mask |= ColumBitEnum.PRIMARY
+    if bit_mask & _AUTOINCREMENT:
+        bit_mask |= _PRIMARY
 
-    if bit_mask & ColumBitEnum.PRIMARY:
-        bit_mask &= ~(ColumBitEnum.INDEX | ColumBitEnum.UNIQUE)
+    if bit_mask & _PRIMARY:
+        bit_mask &= ~(_INDEX | _UNIQUE)
 
-    elif bit_mask & ColumBitEnum.UNIQUE:
-        bit_mask &= ~ColumBitEnum.INDEX
+    elif bit_mask & _UNIQUE:
+        bit_mask &= ~_INDEX
 
     return bit_mask
 
@@ -95,29 +74,29 @@ def parse_colum_into_sql(
     san_table_name, san_colum_name = sanitize_identifiers(table_name, colum_name)
 
     flags = _sanitize_flags(flags)
-    if flags & ColumBitEnum.AUTOINCREMENT and colum_type is not int:
+    if flags & _AUTOINCREMENT and colum_type is not int:
         raise ValueError("AUTOINCREMENT requires a column of type int")
 
     type_sql = _get_colum_type(colum_type)
 
     # region index sql create
     index_sql = None
-    if flags & ColumBitEnum.INDEX:
+    if flags & _INDEX:
         index_sql = f"CREATE INDEX {get_index_identifier(table_name, colum_name)} ON {san_table_name} ({san_colum_name})"
     # endregion
 
     # region colum_sql_create
     colum_sql = f"{san_colum_name} {type_sql}".rstrip()
-    if flags & ColumBitEnum.PRIMARY:
+    if flags & _PRIMARY:
         colum_sql += " PRIMARY KEY"
 
-    if flags & ColumBitEnum.AUTOINCREMENT:
+    if flags & _AUTOINCREMENT:
         colum_sql += " AUTOINCREMENT"
 
-    if flags & ColumBitEnum.NOT_NULL:
+    if flags & _NOT_NULL:
         colum_sql += " NOT NULL"
 
-    if flags & ColumBitEnum.UNIQUE:
+    if flags & _UNIQUE:
         colum_sql += " UNIQUE"
     # endregion
 
@@ -125,6 +104,5 @@ def parse_colum_into_sql(
 
 
 __all__ = [
-    "ColumBitEnum",
     "parse_colum_into_sql",
 ]

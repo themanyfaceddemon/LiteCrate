@@ -1,7 +1,7 @@
 import json
-import re
 import sqlite3
-from functools import lru_cache
+from collections.abc import Generator, Iterable, Iterator
+from contextlib import contextmanager
 from itertools import batched
 from pathlib import Path
 from types import TracebackType
@@ -18,6 +18,13 @@ from ..utils import (
     sanitize_identifier,
     sanitize_identifiers,
 )
+from ..utils.sql import (
+    JSON_ENCODER,
+    build_insert_sql,
+    json_field_expression,
+    json_path,
+    rewrite_where,
+)
 
 
 class Database:
@@ -26,101 +33,6 @@ class Database:
     Schema metadata is stored in the database, and transactions are managed
     explicitly using ``with db:``.
     """
-
-    _QUERY_TOKENS = re.compile(
-        r"(?P<comment>--[^\n]*|/\*.*?(?:\*/|\Z))"
-        r"|(?P<literal>[xX]?'(?:''|[^'])*(?:'|\Z))"
-        r'|(?P<quoted>"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])'
-        r'|(?P<unfinished>["`\[].*\Z)'
-        r"|(?P<param>\?[0-9]*|[:@$][\w$\x80-\U0010ffff]+"
-        r"(?:::[\w$\x80-\U0010ffff]*)*(?:\([^\s)]*\))?)"
-        r"|(?P<number>0[xX][0-9a-fA-F_]+|(?:[0-9][0-9_]*(?:\.[0-9_]*)?"
-        r"|\.[0-9][0-9_]*)(?:[eE][+-]?[0-9][0-9_]*)?)"
-        r"|(?P<word>[A-Za-z_\x80-\U0010ffff][\w$\x80-\U0010ffff]*)"
-        r"|(?P<other>\S)",
-        re.DOTALL,
-    )
-    _SPECIAL_BIND = re.compile(r"\?[0-9]|[:@$]")
-    _SQL_WORDS = frozenset(
-        [
-            "AND",
-            "OR",
-            "NOT",
-            "IS",
-            "NULL",
-            "TRUE",
-            "FALSE",
-            "BETWEEN",
-            "IN",
-            "LIKE",
-            "GLOB",
-            "REGEXP",
-            "MATCH",
-            "ESCAPE",
-            "EXISTS",
-            "CASE",
-            "WHEN",
-            "THEN",
-            "ELSE",
-            "END",
-            "CAST",
-            "AS",
-            "COLLATE",
-            "DISTINCT",
-            "ALL",
-            "SELECT",
-            "FROM",
-            "WHERE",
-            "GROUP",
-            "BY",
-            "HAVING",
-            "ORDER",
-            "LIMIT",
-            "OFFSET",
-            "ASC",
-            "DESC",
-            "UNION",
-            "INTERSECT",
-            "EXCEPT",
-            "JOIN",
-            "ON",
-            "USING",
-            "LEFT",
-            "RIGHT",
-            "INNER",
-            "OUTER",
-            "CROSS",
-            "NATURAL",
-            "WITH",
-            "RECURSIVE",
-            "VALUES",
-            "NULLS",
-            "CURRENT_DATE",
-            "CURRENT_TIME",
-            "CURRENT_TIMESTAMP",
-            "ISNULL",
-            "NOTNULL",
-            "FILTER",
-            "OVER",
-            "PARTITION",
-            "ROWS",
-            "RANGE",
-            "UNBOUNDED",
-            "PRECEDING",
-            "FOLLOWING",
-            "EXCLUDE",
-            "TIES",
-            "OTHERS",
-            "GROUPS",
-            "ROWID",
-            "OID",
-            "_ROWID_",
-            "RETURNING",
-            "INDEXED",
-            "INDEX",
-            "IF",
-        ]
-    )
 
     _CACHE_TYPES: dict[str, type | None] = {
         "None": None,
@@ -198,12 +110,16 @@ class Database:
 
             self._cache[table_name] = columns
 
-    def _save_cache(self, table_name: str) -> None:
-        """Persist the cached column types for a table in SQLite."""
+    def _save_table_metadata(
+        self,
+        table_name: str,
+        column_types: dict[str, type | None],
+    ) -> None:
+        """Write a table's declared column types to the SQLite metadata table."""
 
         columns: list[str] = []
 
-        for name, column_type in self._cache[table_name].items():
+        for name, column_type in column_types.items():
             type_name = "None" if column_type is None else column_type.__name__
 
             if (
@@ -226,180 +142,39 @@ class Database:
             ),
         )
 
-    @staticmethod
-    def _dump_json(value: object) -> str:
-        """Serialize a value as compact, strict JSON without ASCII escaping."""
+    @contextmanager
+    def _schema_transaction(self) -> Generator[None]:
+        """Apply a schema change, its indexes, and its metadata as one operation.
 
-        return json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
-
-    @staticmethod
-    def _json_path(name: str) -> str:
-        """Encode a field name as a single top-level SQLite JSON path key."""
-
-        label = json.dumps(name, ensure_ascii=False)[1:-1].replace(r"\"", r"\u0022")
-        return f'$."{label}"'
-
-    @staticmethod
-    def _local_subqueries(tokens: list[re.Match[str]]) -> set[int]:
-        """Locate subqueries whose local identifiers must not be rewritten."""
-
-        groups: list[int] = []
-        local: set[int] = set()
-        for i, token in enumerate(tokens):
-            raw = token[0]
-            if raw == "(":
-                groups.append(i)
-
-            elif raw == ")" and groups:
-                groups.pop()
-
-            elif groups and raw.upper() in ("FROM", "WITH", "AS"):
-                if raw.upper() == "FROM" and tokens[i - 1][0].upper() == "DISTINCT":
-                    continue
-
-                opening = groups[-1]
-                if tokens[opening + 1][0].upper() in ("SELECT", "WITH"):
-                    local.add(opening)
-
-        return local
-
-    @classmethod
-    @lru_cache(maxsize=128)
-    def _query_parts(cls, query: str) -> tuple[tuple[int, int, str | int], ...]:
-        """Parse reusable SQL token spans for bind parameters and field names.
-
-        String literals and comments are excluded from identifier rewriting.
-        The result is cached by the original condition string.
+        For example, a failed CREATE INDEX rolls back the preceding CREATE
+        TABLE. A savepoint also lets the caller catch that error inside
+        ``with db`` and continue the transaction.
         """
 
-        tokens = [
-            token
-            for token in cls._QUERY_TOKENS.finditer(query)
-            if token.lastgroup != "comment"
-        ]
-        parts: list[tuple[int, int, str | int]] = []
-        last_slot = 0
-        named_slots: dict[str, int] = {}
-        skip_depth = 0
-        upper_query = query.upper()
-        local: set[int] = set()
-        if "SELECT" in upper_query or "WITH" in upper_query:
-            local = cls._local_subqueries(tokens)
+        connection = self._conn
+        inside_transaction = connection.in_transaction
+        connection.execute("SAVEPOINT _litecrate_schema")
+        try:
+            yield
+            connection.execute("RELEASE _litecrate_schema")
 
-        for i, token in enumerate(tokens):
-            raw = token[0]
-            kind = token.lastgroup
-
-            if kind == "unfinished":
-                return ()  # Let SQLite report the malformed expression.
-
-            if kind == "param":
-                if raw == "?":
-                    last_slot += 1
-                    continue
-
-                if raw[0] == "?":
-                    slot = int(raw[1:])
-                    last_slot = max(last_slot, slot)
+        except BaseException:
+            if connection.in_transaction:
+                if inside_transaction:
+                    connection.execute("ROLLBACK TO _litecrate_schema")
+                    connection.execute("RELEASE _litecrate_schema")
 
                 else:
-                    if raw not in named_slots:
-                        last_slot += 1
-                        named_slots[raw] = last_slot
+                    connection.rollback()
 
-                    slot = named_slots[raw]
-
-                parts.append((*token.span(), slot))
-                continue
-
-            # Leave local SQL names and multi-word CAST type names intact.
-            if skip_depth:
-                if raw == "(":
-                    skip_depth += 1
-
-                elif raw == ")":
-                    skip_depth -= 1
-
-                continue
-
-            if i in local:
-                skip_depth = 1
-                continue
-
-            if kind == "word" and raw.upper() == "AS":
-                skip_depth = 1
-                continue
-
-            if kind not in ("word", "quoted"):
-                continue
-
-            previous = tokens[i - 1][0].upper() if i else ""
-            following = tokens[i + 1][0] if i + 1 < len(tokens) else ""
-            if previous in (".", "COLLATE", "IN") or following in (".", "("):
-                continue
-
-            if kind == "word":
-                if raw.upper() in cls._SQL_WORDS or previous == "NULLS":
-                    continue
-
-                name = raw
-
-            elif raw[0] == "[":
-                name = raw[1:-1]
-
-            else:
-                name = raw[1:-1].replace(raw[0] * 2, raw[0])
-
-            if name.isascii() and "\0" not in name:
-                parts.append((*token.span(), normalize_identifier(name)))
-
-        return tuple(parts)
+            raise
 
     def _expand_query(self, table_name: str, query: str, bind_offset: int = 0) -> str:
-        """Rewrite eligible flexible-field references and adjust bind indexes.
-
-        Declared columns remain unchanged; unqualified extra fields are read
-        from ``_data``. ``bind_offset`` accounts for parameters preceding the
-        WHERE clause, such as values assigned by UPDATE.
-        """
-
         columns = self._cache.get(table_name)
         if columns is not None and "_data" not in columns:
             columns = None
 
-        if columns is None and not self._SPECIAL_BIND.search(query):
-            return query
-
-        result: list[str] = []
-        end = 0
-        for start, stop, part in self._query_parts(query):
-            if isinstance(part, int):
-                if part == 0 or (bind_offset == 0 and query[start] == "?"):
-                    continue
-
-                replacement = f"?{part + bind_offset}"
-
-            elif columns is not None and part not in columns:
-                path = self._json_path(part).replace("'", "''")
-                replacement = f"""json_extract("_data", '{path}')"""
-
-            else:
-                continue
-
-            result.append(query[end:start])
-            result.append(replacement)
-            end = stop
-
-        if not result:
-            return query
-
-        result.append(query[end:])
-        return "".join(result)
+        return rewrite_where(query, columns, bind_offset)
 
     def _prepare_values(
         self,
@@ -423,7 +198,8 @@ class Database:
 
         for original_name, value in values.items():
             name = normalize_identifier(original_name)
-            check_column_name(name)
+            if name == "_data":
+                raise ValueError("Column name '_data' is reserved")
 
             if name in known or name in extra:
                 raise ValueError(f"Duplicate column: {name!r}")
@@ -438,7 +214,7 @@ class Database:
                             f"got {type(value).__name__}"
                         )
 
-                    value = self._dump_json(value)
+                    value = JSON_ENCODER.encode(value)
 
                 known[name] = value
 
@@ -454,22 +230,28 @@ class Database:
         self,
         table_name: str,
         row: dict[str, object],
+        columns: dict[str, type | None],
+        typed_columns: Iterable[tuple[str, type | None]],
     ) -> dict[str, object]:
         """Restore typed values and merge flexible JSON fields into a result row.
 
         The internal ``_data`` column is omitted from the returned dictionary.
         """
 
-        columns = self._cache.get(table_name)
-        if columns is None:
-            return row
-
-        for name, column_type in columns.items():
-            if name == "_data" or name not in row or row[name] is None:
+        for name, column_type in typed_columns:
+            if name == "_data":
                 continue
 
-            if column_type is dict or column_type is list:
-                raw_value = row[name]
+            if column_type is bool:
+                value = row.get(name)
+                if value is not None:
+                    row[name] = bool(value)
+
+            elif column_type is dict or column_type is list:
+                raw_value = row.get(name)
+                if raw_value is None:
+                    continue
+
                 if not isinstance(raw_value, (str, bytes, bytearray)):
                     raise TypeError(f"Invalid stored JSON for column {name!r}")
 
@@ -481,11 +263,8 @@ class Database:
 
                 row[name] = parsed
 
-            elif column_type is bool:
-                row[name] = bool(row[name])
-
-        if "_data" in columns and "_data" in row:
-            raw = row.pop("_data")
+        if "_data" in columns:
+            raw = row.pop("_data", None)
             if raw is not None:
                 if not isinstance(raw, (str, bytes, bytearray)):
                     raise TypeError(f"Invalid stored _data in table {table_name!r}")
@@ -495,8 +274,8 @@ class Database:
                     raise ValueError(f"Invalid _data JSON in table {table_name!r}")
 
                 for name, value in extra.items():
-                    if name not in row and name not in columns:
-                        row[name] = value
+                    if name not in columns:
+                        row.setdefault(name, value)
 
         return row
 
@@ -564,15 +343,15 @@ class Database:
             colum_sqls.append(colum_sql)
             column_cache["_data"] = str
 
-        self._conn.execute(
-            f"CREATE TABLE {sanitize_identifier(table_name)} ({', '.join(colum_sqls)})"
-        )
+        san_table = sanitize_identifier(table_name)
+        with self._schema_transaction():
+            self._conn.execute(f"CREATE TABLE {san_table} ({', '.join(colum_sqls)})")
+            for sql in index_sqls:
+                self._conn.execute(sql)
 
-        for sql in index_sqls:
-            self._conn.execute(sql)
+            self._save_table_metadata(table_name, column_cache)
 
         self._cache[table_name] = column_cache
-        self._save_cache(table_name)
 
     def rename_table(self, target: str, value: str) -> None:
         """Rename a table, its metadata, and LiteCrate-generated indexes.
@@ -586,43 +365,79 @@ class Database:
         check_table_name(target, value)
         san_target, san_value = sanitize_identifiers(target, value)
 
-        indexed_columns = []
+        with self._schema_transaction():
+            indexes = list(self._managed_indexes(target, san_target))
+            self._conn.execute(f"ALTER TABLE {san_target} RENAME TO {san_value}")
 
-        for index_name in self.get_table_indexes(target):
-            info = self._conn.execute(
-                f"PRAGMA index_info({sanitize_identifier(index_name)})"
-            ).fetchall()
+            for index_name, column_name, expression in indexes:
+                new_index = get_index_identifier(value, column_name)
+                self._conn.execute(f"DROP INDEX {index_name}")
+                self._conn.execute(
+                    f"CREATE INDEX {new_index} ON {san_value} ({expression})"
+                )
 
-            if len(info) != 1:
-                continue
-
-            column_name = info[0][2]
-            if column_name is None or not column_name.isascii():
-                continue
-
-            column_name = normalize_identifier(column_name)
-            if index_name == get_index_identifier(target, column_name):
-                indexed_columns.append(column_name)
-
-        self._conn.execute(f"ALTER TABLE {san_target} RENAME TO {san_value}")
-
-        for column_name in indexed_columns:
-            old_index = get_index_identifier(target, column_name)
-            new_index = get_index_identifier(value, column_name)
-            san_column = sanitize_identifier(column_name)
-
-            self._conn.execute(f"DROP INDEX {old_index}")
             self._conn.execute(
-                f"CREATE INDEX {new_index} ON {san_value} ({san_column})"
+                "UPDATE _litecrate_meta SET table_name = ? WHERE table_name = ?",
+                (value, target),
             )
 
         if target in self._cache:
             self._cache[value] = self._cache.pop(target)
 
-        self._conn.execute(
-            "UPDATE _litecrate_meta SET table_name = ? WHERE table_name = ?",
-            (value, target),
+    def _managed_indexes(
+        self,
+        table_name: str,
+        san_table: str,
+    ) -> Iterator[tuple[str, str, str]]:
+        indexes = self._conn.execute(
+            "SELECT name, sql FROM sqlite_schema "
+            "WHERE type = 'index' AND tbl_name = ? COLLATE NOCASE "
+            "AND name GLOB 'idx_*' AND sql IS NOT NULL",
+            (table_name,),
         )
+        for index_name, sql in indexes:
+            info = self._conn.execute(
+                f"PRAGMA index_info({sanitize_identifier(index_name)})"
+            ).fetchall()
+            if len(info) != 1:
+                continue
+
+            column_name = info[0][2]
+            if column_name is None:
+                # SQLite reports NULL for expression indexes. Recover the field
+                # from the exact SQL emitted by create_index().
+                prefix = f"""CREATE INDEX {index_name} ON {san_table} (json_extract("_data", '$."""
+                suffix = "'))"
+                if not sql.startswith(prefix) or not sql.endswith(suffix):
+                    continue
+
+                try:
+                    label = sql.removeprefix(prefix).removesuffix(suffix)
+                    column_name = json.loads(label.replace("''", "'"))
+
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    not isinstance(column_name, str)
+                    or not column_name.isascii()
+                    or "\0" in column_name
+                ):
+                    continue
+
+                expression = json_field_expression(column_name)
+
+                if sql != f"CREATE INDEX {index_name} ON {san_table} ({expression})":
+                    continue
+
+            else:
+                if not column_name.isascii():
+                    continue
+
+                column_name = normalize_identifier(column_name)
+                expression = sanitize_identifier(column_name)
+
+            if index_name == get_index_identifier(table_name, column_name):
+                yield index_name, column_name, expression
 
     def get_tables(self, include_internal: bool = False) -> list[str]:
         """Return sorted table names, optionally including SQLite internal tables.
@@ -648,11 +463,14 @@ class Database:
 
         target = normalize_identifier(target)
         check_table_name(target)
-        self._conn.execute(f"DROP TABLE IF EXISTS {sanitize_identifier(target)}")
+        san_target = sanitize_identifier(target)
+        with self._schema_transaction():
+            self._conn.execute(f"DROP TABLE IF EXISTS {san_target}")
+            self._conn.execute(
+                "DELETE FROM _litecrate_meta WHERE table_name = ?", (target,)
+            )
+
         self._cache.pop(target, None)
-        self._conn.execute(
-            "DELETE FROM _litecrate_meta WHERE table_name = ?", (target,)
-        )
 
     # endregion
 
@@ -673,25 +491,12 @@ class Database:
 
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
-        san_table = sanitize_identifier(table_name)
-
         known, extra = self._prepare_values(table_name, values)
-
         if extra:
-            known["_data"] = self._dump_json(extra)
+            known["_data"] = JSON_ENCODER.encode(extra)
 
-        if not known:
-            cursor = self._conn.execute(f"INSERT INTO {san_table} DEFAULT VALUES")
-            return cursor.lastrowid
-
-        columns = ", ".join(sanitize_identifier(name) for name in known)
-        placeholders = ", ".join("?" for _ in known)
-
-        cursor = self._conn.execute(
-            f"INSERT INTO {san_table} ({columns}) VALUES ({placeholders})",
-            tuple(known.values()),
-        )
-        return cursor.lastrowid
+        sql = build_insert_sql(table_name, tuple(known))
+        return self._conn.execute(sql, tuple(known.values())).lastrowid
 
     def update(
         self,
@@ -740,12 +545,8 @@ class Database:
             raise ValueError("UPDATE requires at least one value")
 
         known, extra = self._prepare_values(table_name, values)
-        assignments: list[str] = []
-        params: list[object] = []
-
-        for name, value in known.items():
-            assignments.append(f"{sanitize_identifier(name)} = ?")
-            params.append(value)
+        assignments = [f"{sanitize_identifier(name)} = ?" for name in known]
+        params = list(known.values())
 
         if extra:
             data_sql = """COALESCE("_data", '{}')"""
@@ -755,7 +556,7 @@ class Database:
                 json_args = ", ".join(["?, json(?)"] * len(batch))
                 data_sql = f"json_set({data_sql}, {json_args})"
                 for name, value in batch:
-                    params.extend((self._json_path(name), self._dump_json(value)))
+                    params.extend((json_path(name), JSON_ENCODER.encode(value)))
 
             assignments.append(f'"_data" = {data_sql}')
 
@@ -794,7 +595,9 @@ class Database:
 
         return self._delete(table_name, None, ())
 
-    def _delete(self, table_name: str, query: str | None, args: tuple[object, ...]) -> int:
+    def _delete(
+        self, table_name: str, query: str | None, args: tuple[object, ...]
+    ) -> int:
         table_name = normalize_identifier(table_name)
         check_table_name(table_name)
 
@@ -834,7 +637,21 @@ class Database:
 
         cursor = self._conn.execute(sql, args)
         columns = [column[0] for column in cursor.description]
-        return [self._decode_row(table_name, dict(zip(columns, row))) for row in cursor]
+        declared = self._cache.get(table_name, {})
+        typed_columns = tuple(
+            (name, column_type)
+            for name, column_type in declared.items()
+            if name != "_data" and column_type in (dict, list, bool)
+        )
+        if not typed_columns and "_data" not in declared:
+            return [dict(zip(columns, row)) for row in cursor]
+
+        return [
+            self._decode_row(
+                table_name, dict(zip(columns, row)), declared, typed_columns
+            )
+            for row in cursor
+        ]
 
     def select_one(
         self,
@@ -862,7 +679,12 @@ class Database:
             return None
 
         columns = [column[0] for column in cursor.description]
-        return self._decode_row(table_name, dict(zip(columns, row)))
+        result = dict(zip(columns, row))
+        declared = self._cache.get(table_name)
+        if declared is not None:
+            return self._decode_row(table_name, result, declared, declared.items())
+
+        return result
 
     def count(
         self,
@@ -909,27 +731,48 @@ class Database:
             )
         ]
 
-    def create_index(self, table_name: str, column_name: str) -> None:
-        """Create a named index on an existing SQLite column.
+    def create_index(
+        self,
+        table_name: str,
+        column_name: str,
+        *,
+        flexible: bool = False,
+    ) -> None:
+        """Create a named index on a declared column or a flexible field.
 
-        This does not check for redundant indexes. SQLite raises an error
-        if the generated index name is already in use.
+        Pass ``flexible=True`` to index an undeclared JSON field in a flexible
+        table. SQLite raises an error if the generated name is already in use.
         """
 
         table_name, column_name = normalize_identifiers(table_name, column_name)
-        san_table, san_column = sanitize_identifiers(table_name, column_name)
-        # SQLite builds can interpret a double-quoted missing column as text
-        # and silently create an index on a constant expression.
-        if not any(
-            row[1].lower() == column_name
-            for row in self._conn.execute(f"PRAGMA table_xinfo({san_table})")
-        ):
-            raise sqlite3.OperationalError(
-                f"No such column {column_name!r} in table {table_name!r}"
-            )
+        san_table = sanitize_identifier(table_name)
+        if flexible:
+            check_column_name(column_name)
+            columns = self._cache.get(table_name, {})
+            if "_data" not in columns:
+                raise ValueError(f"Table {table_name!r} has no flexible fields")
+
+            if column_name in columns:
+                raise ValueError(
+                    f"Column {column_name!r} is declared in table {table_name!r}"
+                )
+
+            expression = json_field_expression(column_name)
+
+        else:
+            # SQLite can treat a double-quoted missing column as a string.
+            if not any(
+                row[1].lower() == column_name
+                for row in self._conn.execute(f"PRAGMA table_xinfo({san_table})")
+            ):
+                raise sqlite3.OperationalError(
+                    f"No such column {column_name!r} in table {table_name!r}"
+                )
+
+            expression = sanitize_identifier(column_name)
 
         self._conn.execute(
-            f"CREATE INDEX {get_index_identifier(table_name, column_name)} ON {san_table} ({san_column})"
+            f"CREATE INDEX {get_index_identifier(table_name, column_name)} ON {san_table} ({expression})"
         )
 
     def remove_index(self, table_name: str, column_name: str) -> None:
@@ -1031,7 +874,8 @@ class Database:
         if self._rollback_cache is not None:
             raise RuntimeError("Nested transactions are not supported")
 
-        snapshot = self._cache.copy()
+        # fuking magic
+        snapshot = {table: columns.copy() for table, columns in self._cache.items()}
         self._conn.execute("BEGIN")
         self._rollback_cache = snapshot
         return self

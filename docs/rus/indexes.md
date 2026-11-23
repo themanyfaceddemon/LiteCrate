@@ -29,7 +29,7 @@ db.create_table(
 
 | Метод | Действие |
 |---|---|
-| `create_index(table_name, column_name)` | Создать индекс по колонке. |
+| `create_index(table_name, column_name, *, flexible=False)` | Создать индекс по колонке или по гибкому полю с `flexible=True`. |
 | `remove_index(table_name, column_name)` | Удалить индекс с именем, генерируемым LiteCrate; отсутствие индекса допускается. |
 | `get_table_indexes(table_name)` | Получить отсортированный список имён индексов таблицы. |
 
@@ -49,3 +49,15 @@ db.remove_index("players", "level")
 `get_table_indexes()` не показывает автоматические индексы SQLite, создаваемые для ограничений `UNIQUE` и `PRIMARY KEY`. Удаление индекса LiteCrate не отменяет сами эти ограничения.
 
 Если схема известна заранее, обычно удобнее объявить индекс флагом `i` в `create_table()`.
+
+## Индексы по гибким полям
+
+В таблице, созданной с `flexible=True`, можно индексировать дополнительное поле верхнего уровня. SQLite может использовать индекс для условий и сортировки по этому полю.
+
+```python
+db.create_index("players", "nickname", flexible=True)
+player = db.select_one("players", "nickname = ?", "Pilot")
+db.remove_index("players", "nickname")
+```
+
+Индекс можно добавить к существующей гибкой таблице. SQLite хранит его отдельно и обновляет при записи. `get_table_indexes()` показывает такие индексы, а `rename_table()` переносит их под новым именем таблицы.
